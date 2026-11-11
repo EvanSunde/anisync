@@ -1,0 +1,16 @@
+[Unit]
+Description=anisync - AniList/MyAnimeList/VNDB tracker for local playback
+After=dbus.socket
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/anisync daemon
+Restart=on-failure
+RestartSec=15
+Nice=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target

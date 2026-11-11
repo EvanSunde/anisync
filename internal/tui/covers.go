@@ -73,6 +73,11 @@ func (c *covers) request(id uint32, url string) tea.Cmd {
 	if !c.enabled || id == 0 {
 		return nil
 	}
+	// No URL yet (e.g. a show opened from Related before its details
+	// loaded): wait for the URL instead of recording a failure.
+	if url == "" && !coverCached(id) {
+		return nil
+	}
 	c.mu.Lock()
 	if c.state[id] != coverNone {
 		c.mu.Unlock()

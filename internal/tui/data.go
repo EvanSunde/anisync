@@ -270,9 +270,18 @@ func vocabCmd() tea.Cmd {
 	}
 }
 
+func coverPath(id uint32) string {
+	return filepath.Join(cacheDir(), "covers", fmt.Sprintf("%d.png", id))
+}
+
+func coverCached(id uint32) bool {
+	_, err := os.Stat(coverPath(id))
+	return err == nil
+}
+
 // fetchCover downloads (or loads from cache) a cover as PNG.
 func fetchCover(id uint32, url string) ([]byte, error) {
-	path := filepath.Join(cacheDir(), "covers", fmt.Sprintf("%d.png", id))
+	path := coverPath(id)
 	if b, err := os.ReadFile(path); err == nil {
 		return b, nil
 	}

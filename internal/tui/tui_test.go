@@ -441,3 +441,25 @@ func TestHighlightAndChipGlue(t *testing.T) {
 		t.Fatalf("glue: %q", b.lines)
 	}
 }
+
+// A show opened from Related/recommendations has no cover URL until its
+// details load; asking for the cover early must not mark it failed, or the
+// cover never shows once the URL arrives.
+func TestCoverForRelatedShowLoads(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	m := searchModel(150, 44)
+	m.cov.state = map[uint32]int{}
+	m.Update(key("enter"))
+	m.peek = append(m.peek, row{AnilistID: 182255, Title: "Sousou no Frieren 2nd Season", Format: "TV"})
+	// debounce fires before details arrive: no URL yet
+	m.Update(debounceMsg{id: 182255})
+	if s := m.cov.get(182255); s != coverNone {
+		t.Fatalf("cover state after URL-less request = %d, want none", s)
+	}
+	d := mk(182255, "Sousou no Frieren 2nd Season", 10, 88, "", 0)
+	d.CoverImage.Large = "https://example.invalid/cover.jpg"
+	_, cmd := m.Update(detailMsg{key: 182255, m: &d})
+	if cmd == nil || m.cov.get(182255) != coverLoading {
+		t.Fatalf("cover not requested once the URL is known (state %d)", m.cov.get(182255))
+	}
+}

@@ -1,0 +1,79 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Vet
+        run: |
+          go vet ./...
+          go vet -tags e2e ./...
+          test -z "$(gofmt -l .)" || { gofmt -l .; echo "run gofmt"; exit 1; }
+      - name: Unit tests
+        run: go test -race ./...
+      - name: End-to-end tests (real D-Bus session, fake MPRIS player, mock APIs)
+        run: |
+          command -v dbus-run-session || { sudo apt-get update && sudo apt-get install -y dbus; }
+          dbus-run-session -- go test -race -tags e2e ./internal/e2e/
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          version="${GITHUB_REF_NAME}"
+          [[ "$GITHUB_REF" == refs/tags/* ]] || version="$(git rev-parse --short HEAD)"
+          mkdir -p dist
+          go build -trimpath -ldflags="-s -w -X main.version=${version}" -o dist/anisync ./cmd/anisync
+          cp README.md contrib/anisync.service dist/
+          tar -C dist -czf "anisync-linux-${ARCH}.tar.gz" anisync README.md anisync.service
+      - uses: actions/upload-artifact@v4
+        with:
+          name: anisync-linux-${{ matrix.arch }}
+          path: anisync-linux-${{ matrix.arch }}.tar.gz
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Checksums
+        run: sha256sum anisync-linux-*.tar.gz > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            anisync-linux-*.tar.gz
+            SHA256SUMS
+          generate_release_notes: true

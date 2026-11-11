@@ -1,5 +1,7 @@
 # anisync
 
+[![build](https://github.com/evansunde/anisync/actions/workflows/build.yml/badge.svg)](https://github.com/evansunde/anisync/actions/workflows/build.yml)
+
 A small background daemon that updates **AniList** and **MyAnimeList** (at the same time) when you watch anime in a local player (mpv, VLC, Celluloid, Haruna, …), and **VNDB** when you play visual novels. Works offline: updates are queued and sent when you're back online.
 
 - **Works on any desktop.** It uses MPRIS over D-Bus instead of compositor window titles, so niri, Hyprland, Plasma, GNOME and Sway behave the same. It also gets the real file path, not a truncated window title.
@@ -15,6 +17,14 @@ A small background daemon that updates **AniList** and **MyAnimeList** (at the s
 - **VNDB (optional, off by default).** It detects a running VN from your VN folders (native or Wine/Proton), marks it *Playing*, tracks playtime, and can write it into your list notes. `anisync vn finish -vote 8.5` marks it finished.
 
 ## Install
+
+**Prebuilt (x86_64 / arm64, static):** download `anisync-linux-<arch>.tar.gz` from [Releases](https://github.com/evansunde/anisync/releases), then:
+
+```bash
+tar -xzf anisync-linux-amd64.tar.gz && install -Dm755 anisync ~/.local/bin/anisync && install -Dm644 anisync.service ~/.config/systemd/user/anisync.service && anisync init
+```
+
+**From source:**
 
 Needs Go ≥ 1.24 to build (or use the prebuilt x86_64 binary).
 
@@ -228,6 +238,12 @@ Logs: `journalctl --user -u anisync -f`
 - **Nothing updates while offline.** That's expected. `anisync status` shows the queue and when the next retry happens.
 
 ## Development
+
+CI (`.github/workflows/build.yml`) runs vet, the unit tests and the end-to-end tests on every push and pull request, and builds static x86_64 and arm64 binaries. Pushing a tag like `v0.1.0` publishes them as a GitHub release with SHA256 checksums:
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
 
 ```bash
 make test

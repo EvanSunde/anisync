@@ -15,6 +15,7 @@ import (
 	"github.com/evansunde/anisync/internal/media"
 	"github.com/evansunde/anisync/internal/mpris"
 	"github.com/evansunde/anisync/internal/store"
+	"github.com/evansunde/anisync/internal/vnlist"
 )
 
 type Status struct {
@@ -27,6 +28,24 @@ type Status struct {
 	VNActive map[string]string `json:"vn_active,omitempty"`
 	AuthErr  []string          `json:"auth_errors,omitempty"`
 	Now      []NowPlaying      `json:"now,omitempty"`
+	VNNow    []VNNow           `json:"vn_now,omitempty"`
+}
+
+// VNNow is a running visual novel as the daemon understands it.
+type VNNow struct {
+	Folder   string        `json:"folder"`
+	Key      string        `json:"key"`
+	Session  time.Duration `json:"session"`
+	Playtime time.Duration `json:"playtime"` // total, including this session
+	Title    string        `json:"title,omitempty"`
+	VNDBID   string        `json:"vndb_id,omitempty"`
+	Pending  bool          `json:"pending,omitempty"`
+	Ignored  bool          `json:"ignored,omitempty"`
+}
+
+type VNListReply struct {
+	List  vnlist.List `json:"list"`
+	Error string      `json:"error,omitempty"`
 }
 
 // NowPlaying is a player's current file as the daemon understands it.
@@ -56,6 +75,7 @@ type SearchArgs struct {
 
 type VNFinishArgs struct {
 	Name string `json:"name"`
+	Key  string `json:"key,omitempty"` // exact VN key (from status), instead of Name
 	Vote int    `json:"vote"`
 }
 
@@ -193,6 +213,24 @@ func (d *Daemon) handleIPC(r ipc.Request) (any, error) {
 		return d.mal.List(ctx)
 	case "vn-list":
 		return d.vnList(), nil
+	case "vnlist":
+		return VNListReply{List: d.vnCacheCopy()}, nil
+	case "vnlist-refresh":
+		var rep VNListReply
+		d.syncMu.Lock()
+		err := d.refreshVNList(ctx)
+		d.syncMu.Unlock()
+		if err != nil {
+			rep.Error = err.Error()
+		}
+		rep.List = d.vnCacheCopy()
+		return rep, nil
+	case "vnset":
+		var a VNSetArgs
+		if err := json.Unmarshal(r.Args, &a); err != nil {
+			return nil, err
+		}
+		return d.enqueueVNSet(a)
 	case "vn-finish":
 		var a VNFinishArgs
 		if err := json.Unmarshal(r.Args, &a); err != nil {
@@ -235,11 +273,34 @@ func (d *Daemon) status() Status {
 	d.stateMu.Unlock()
 	if d.scanner != nil {
 		s.VNActive = map[string]string{}
-		for k, dur := range d.scanner.Active() {
+		active := d.scanner.Active()
+		for k, dur := range active {
 			s.VNActive[k] = dur.Round(time.Second).String()
 		}
+		s.VNNow = d.vnNow(active)
 	}
 	return s
+}
+
+func (d *Daemon) vnNow(active map[string]time.Duration) []VNNow {
+	d.st.Lock()
+	defer d.st.Unlock()
+	var out []VNNow
+	for folder, dur := range active {
+		k := media.VNKey(folder)
+		n := VNNow{Folder: folder, Key: k, Session: dur, Playtime: dur}
+		if e := d.st.S.VN[k]; e != nil {
+			n.Playtime += e.Playtime
+		}
+		if m, ok := d.st.S.Mappings[k]; ok && m.VNDBID != "" {
+			n.Title, n.VNDBID = m.Title, m.VNDBID
+		}
+		_, n.Pending = d.st.S.Pending[k]
+		_, n.Ignored = d.st.S.Ignored[k]
+		out = append(out, n)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Folder < out[j].Folder })
+	return out
 }
 
 func (d *Daemon) search(ctx context.Context, a SearchArgs) ([]store.Candidate, error) {
@@ -298,7 +359,7 @@ func (d *Daemon) undo(ctx context.Context, id int64) (*store.HistoryEntry, error
 	var h *store.HistoryEntry
 	for i := len(d.st.S.History) - 1; i >= 0; i-- {
 		e := d.st.S.History[i]
-		if (id == 0 && !e.Undone && (e.Kind == "anime" || e.Kind == "set") && len(e.Before) > 0) || e.ID == id {
+		if (id == 0 && !e.Undone && (((e.Kind == "anime" || e.Kind == "set") && len(e.Before) > 0) || e.BeforeVN != nil)) || e.ID == id {
 			h = e
 			break
 		}
@@ -310,8 +371,12 @@ func (d *Daemon) undo(ctx context.Context, id int64) (*store.HistoryEntry, error
 	if h.Undone {
 		return nil, errors.New("already undone")
 	}
-	if h.Kind != "anime" && h.Kind != "set" {
-		return nil, errors.New("only anime updates can be undone")
+	if h.BeforeVN != nil {
+		if err := d.undoVN(ctx, h.VNDBID, *h.BeforeVN); err != nil {
+			return nil, fmt.Errorf("VNDB: %w", err)
+		}
+	} else if h.Kind != "anime" && h.Kind != "set" {
+		return nil, errors.New("this update can't be undone")
 	}
 	for svc, before := range h.Before {
 		var err error
@@ -352,7 +417,11 @@ func (d *Daemon) undo(ctx context.Context, id int64) (*store.HistoryEntry, error
 	d.stateMu.Lock()
 	d.listFetched = time.Time{}
 	d.stateMu.Unlock()
-	log.Printf("undid update %d (%s ep %d)", h.ID, h.Title, h.Episode)
+	if h.Episode > 0 {
+		log.Printf("undid update %d (%s ep %d)", h.ID, h.Title, h.Episode)
+	} else {
+		log.Printf("undid update %d (%s)", h.ID, h.Title)
+	}
 	return h, nil
 }
 
@@ -370,18 +439,34 @@ func (d *Daemon) vnList() []VNInfo {
 
 func (d *Daemon) vnFinish(a VNFinishArgs) (string, error) {
 	nq := media.Normalize(a.Name)
+	it, err := d.vnFinishItem(a, nq)
+	if err != nil {
+		return "", err
+	}
+	d.overlay(it)
+	d.Kick()
+	return it.Title, nil
+}
+
+func (d *Daemon) vnFinishItem(a VNFinishArgs, nq string) (*store.Item, error) {
 	d.st.Lock()
 	defer d.st.Unlock()
 	var matches []string
 	var keys []string
 	for k, e := range d.st.S.VN {
 		m := d.st.S.Mappings[k]
+		if a.Key != "" {
+			if k == a.Key {
+				matches, keys = append(matches, e.Dir), append(keys, k)
+			}
+			continue
+		}
 		if nq == "" || strings.Contains(media.Normalize(e.Dir), nq) || strings.Contains(media.Normalize(m.Title), nq) || m.VNDBID == a.Name {
 			matches = append(matches, e.Dir)
 			keys = append(keys, k)
 		}
 	}
-	if nq == "" && len(keys) > 1 { // default: most recently played
+	if a.Key == "" && nq == "" && len(keys) > 1 { // default: most recently played
 		var best string
 		var bt time.Time
 		for _, k := range keys {
@@ -393,14 +478,13 @@ func (d *Daemon) vnFinish(a VNFinishArgs) (string, error) {
 		matches = []string{d.st.S.VN[best].Dir}
 	}
 	if len(keys) == 0 {
-		return "", fmt.Errorf("no tracked VN matches %q (see: anisync vn list)", a.Name)
+		return nil, fmt.Errorf("no tracked VN matches %q (see: anisync vn list)", a.Name)
 	}
 	if len(keys) > 1 {
-		return "", fmt.Errorf("ambiguous, matches: %s", strings.Join(matches, ", "))
+		return nil, fmt.Errorf("ambiguous, matches: %s", strings.Join(matches, ", "))
 	}
-	d.st.S.Queue = append(d.st.S.Queue, &store.Item{ID: d.st.NewID(), Kind: "vn", Key: keys[0], Title: matches[0],
-		Action: "finish", Vote: a.Vote, Created: time.Now()})
-	err := d.st.Save()
-	d.Kick()
-	return matches[0], err
+	it := &store.Item{ID: d.st.NewID(), Kind: "vn", Key: keys[0], Title: matches[0], Action: "finish", Vote: a.Vote, Created: time.Now()}
+	d.st.S.Queue = append(d.st.S.Queue, it)
+	cp := *it
+	return &cp, d.st.Save()
 }

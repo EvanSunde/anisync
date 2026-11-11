@@ -101,7 +101,9 @@ var aliases = map[string]string{"short": "short", "tv_short": "short", "film": "
 	"lowest": "worst", "light_novel": "ln", "lightnovel": "ln", "web_novel": "wn", "webnovel": "wn", "visual_novel": "vn",
 	"video_game": "game", "japan": "jp", "china": "cn", "korea": "kr", "taiwan": "tw", "least": "obscure"}
 
-func find(cs []Choice, s string) (Choice, bool) {
+func find(cs []Choice, s string) (Choice, bool) { return findIn(cs, s, aliases) }
+
+func findIn(cs []Choice, s string, aliases map[string]string) (Choice, bool) {
 	s = strings.ToLower(s)
 	if a, ok := aliases[s]; ok {
 		s = a
@@ -319,6 +321,9 @@ func scaleScore(val string) string {
 	if len(val) > 0 && (val[0] == '>' || val[0] == '<') {
 		prefix, val = val[:1], val[1:]
 	}
+	if len(val) > 0 && val[0] == '=' {
+		prefix, val = prefix+"=", val[1:]
+	}
 	parts := strings.Split(val, "-")
 	nums := make([]float64, len(parts))
 	for i, p := range parts {
@@ -403,6 +408,10 @@ func splitKV(tok string) (key, val string, op byte, ok bool) {
 	if op == ':' {
 		op = '='
 	}
+	// ">=" / "<=": inclusive bounds, op 'G' / 'L'
+	if (op == '>' || op == '<') && len(val) > 1 && val[0] == '=' {
+		op, val = map[byte]byte{'>': 'G', '<': 'L'}[op], val[1:]
+	}
 	return key, val, op, true
 }
 
@@ -417,6 +426,9 @@ func parseRange(val string, op byte, lo, hi int, min, max, exact *int) error {
 	}
 	if op == '=' && len(val) > 1 && (val[0] == '>' || val[0] == '<') {
 		op, val = val[0], val[1:]
+	}
+	if op == '=' && len(val) > 1 && val[0] == '=' {
+		val = val[1:]
 	}
 	if a, b, ok := strings.Cut(val, "-"); ok && op == '=' {
 		var x, y int
@@ -446,6 +458,10 @@ func parseRange(val string, op byte, lo, hi int, min, max, exact *int) error {
 		*min = n + 1
 	case '<':
 		*max = n - 1
+	case 'G':
+		*min = n
+	case 'L':
+		*max = n
 	default:
 		*exact = n
 	}

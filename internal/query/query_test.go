@@ -87,3 +87,10 @@ func TestFormatRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+func TestInclusiveBounds(t *testing.T) {
+	f, w := Parse(`score>=75 y:>=2018 eps<=12`, vocab)
+	if len(w) > 0 || f.ScoreMin != 75 || f.YearFrom != 2018 || f.EpsMax != 12 {
+		t.Fatalf("%+v %v", f, w)
+	}
+}

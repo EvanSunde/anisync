@@ -41,7 +41,7 @@ Usage:
   anisync daemon                 run the background tracker (use the systemd unit)
   anisync init                   write a default config file
   anisync auth anilist|mal|vndb  log in to a service
-  anisync tui                    browse/search anime, manage your list, pick matches
+  anisync tui [vn]               browse/search anime (or visual novels), manage your lists, pick matches
 
   anisync status                 services, players, queued updates
   anisync resolve                pick the right show for titles that couldn't be matched
@@ -51,11 +51,12 @@ Usage:
   anisync mappings               list remembered title mappings
   anisync sync                   retry queued updates now and refresh lists
   anisync history [N]            recent updates
-  anisync undo [ID]              revert the last (or given) anime update
+  anisync undo [ID]              revert the last (or given) update (anime or VNDB list)
 
   anisync vn list                tracked visual novels and playtime
   anisync vn finish [name] [-vote 8.5]
                                  mark a VN finished on VNDB (default: last played)
+  anisync vn tui                 the TUI in visual novel mode
 `
 
 func main() {
@@ -85,7 +86,8 @@ func main() {
 	case "auth":
 		err = auth(args)
 	case "tui", "ui":
-		err = tui.Run()
+		vn := len(args) > 0 && strings.TrimLeft(args[0], "-") == "vn"
+		err = tui.Run(vn)
 	case "status":
 		err = status()
 	case "resolve", "pending":
@@ -628,6 +630,8 @@ func vnCmd(args []string) error {
 		args = []string{"list"}
 	}
 	switch args[0] {
+	case "tui", "ui":
+		return tui.Run(true)
 	case "list":
 		var l []daemon.VNInfo
 		if err := call("vn-list", nil, &l); err != nil {

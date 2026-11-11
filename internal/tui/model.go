@@ -44,6 +44,9 @@ const (
 	modalProgress
 	modalDelete
 	modalHelp
+	modalStarted  // VN: started date
+	modalFinished // VN: finished date
+	modalFinish   // VN (now): mark finished with a vote
 )
 
 // list sections, in display order ("" = all)
@@ -58,12 +61,15 @@ type resolveTarget struct {
 }
 
 type model struct {
-	w, h   int
-	tab    tabID
-	al     *anilist.Client
-	userID int
-	vocab  *query.Vocab
-	cov    *covers
+	w, h    int
+	tab     tabID
+	vn      bool    // visual novel mode (VNDB)
+	vs      vnState // VN mode state
+	startVN bool
+	al      *anilist.Client
+	userID  int
+	vocab   *query.Vocab
+	cov     *covers
 
 	// detail panel
 	details     map[uint32]*anilist.Media
@@ -123,8 +129,8 @@ type model struct {
 	thr       float64
 }
 
-// Run starts the TUI.
-func Run() error {
+// Run starts the TUI (in VN mode if vn is set).
+func Run(vn bool) error {
 	tok, err := store.LoadTokens(config.ConfigDir())
 	if err != nil {
 		return err
@@ -132,6 +138,7 @@ func Run() error {
 	cfg, _ := config.Load()
 	m := newModel()
 	m.thr = cfg.Threshold
+	m.vs.covers, m.vs.token, m.vs.user, m.startVN = cfg.VNCovers, tok.VNDB.Token, tok.VNDB.UserID, vn
 	if cfg.AniList.Enabled && tok.AniList.Token != "" {
 		m.al.Token, m.userID = tok.AniList.Token, tok.AniList.UserID
 	}
@@ -152,6 +159,7 @@ func newModel() *model {
 		page:      1,
 		cov:       &covers{state: map[uint32]int{}},
 		f:         anilist.Filter{Status: "RELEASING", Sort: []string{"TRENDING_DESC"}},
+		vs:        newVNState(),
 	}
 	m.input = textinput.New()
 	m.input.Prompt = "  "
@@ -167,7 +175,11 @@ func newModel() *model {
 func (m *model) Init() tea.Cmd {
 	m.loading = true
 	m.listSyncing = true
-	return tea.Batch(localListCmd(), m.syncListCmd(), vocabCmd(), m.searchCmd(m.f, 1, m.seq), statusCmd(), pendingCmd(), tick())
+	cmds := []tea.Cmd{localListCmd(), m.syncListCmd(), vocabCmd(), m.searchCmd(m.f, 1, m.seq), statusCmd(), pendingCmd(), tick()}
+	if m.startVN {
+		cmds = append(cmds, m.setMode(true))
+	}
+	return tea.Batch(cmds...)
 }
 
 // ---------------------------------------------------------------- selection
@@ -246,6 +258,9 @@ func (m *model) flash(s string, isErr bool) { m.msg, m.msgErr = s, isErr }
 
 // selChanged schedules loading the detail/cover of the selected show.
 func (m *model) selChanged() tea.Cmd {
+	if m.vn {
+		return m.vnSelChanged()
+	}
 	m.dScroll, m.link = 0, 0
 	r := m.current()
 	if r == nil {
@@ -260,6 +275,9 @@ func (m *model) selChanged() tea.Cmd {
 // ---------------------------------------------------------------- update
 
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if cmd, ok := m.vnUpdate(msg); ok {
+		return m, cmd
+	}
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.w, m.h = msg.Width, msg.Height
@@ -277,9 +295,15 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if n := len(msg.st.Queue); n != m.queueLen {
 				m.queueLen = n
 				cmd = daemonListCmd()
+				if m.vs.started {
+					cmd = tea.Batch(cmd, daemonVNListCmd())
+				}
 			}
 			if m.nSel >= m.nowCount() {
 				m.nSel = max(0, m.nowCount()-1)
+			}
+			if m.vs.nSel >= m.vnNowCount() {
+				m.vs.nSel = max(0, m.vnNowCount()-1)
 			}
 		}
 		return m, cmd
@@ -338,7 +362,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case liveSearchMsg:
-		if msg.seq == m.liveSeq {
+		if msg.seq == m.liveSeq && msg.vn == m.vn {
 			return m, m.runSearch()
 		}
 		return m, nil
@@ -389,6 +413,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds := []tea.Cmd{pendingCmd(), statusCmd()}
 		if msg.reload {
 			cmds = append(cmds, daemonListCmd())
+			if m.vs.started {
+				cmds = append(cmds, daemonVNListCmd())
+			}
 		}
 		return m, tea.Batch(cmds...)
 
@@ -452,23 +479,31 @@ func (m *model) key(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.panelKey(k)
 	}
 	if m.typing {
+		in := m.searchInput()
 		switch s {
 		case "enter":
 			m.typing = false
-			m.input.Blur()
-			m.f, m.warns = query.Parse(m.input.Value(), m.vocab)
-			if strings.TrimSpace(m.input.Value()) == "" {
+			in.Blur()
+			if m.vn {
+				m.vs.f, m.vs.warns = query.ParseVN(in.Value(), m.vs.vocab)
+				if strings.TrimSpace(in.Value()) == "" {
+					m.vs.f = defaultVNFilter
+				}
+				return m, m.runSearch()
+			}
+			m.f, m.warns = query.Parse(in.Value(), m.vocab)
+			if strings.TrimSpace(in.Value()) == "" {
 				m.f = anilist.Filter{Status: "RELEASING", Sort: []string{"TRENDING_DESC"}}
 			}
 			return m, m.runSearch()
 		case "esc":
 			m.typing = false
-			m.input.Blur()
-			m.input.SetValue(query.Format(m.f))
+			in.Blur()
+			in.SetValue(m.spec().format())
 			return m, nil
 		}
 		var cmd tea.Cmd
-		m.input, cmd = m.input.Update(k)
+		*in, cmd = in.Update(k)
 		return m, cmd
 	}
 	if m.filtering {
@@ -479,12 +514,12 @@ func (m *model) key(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if s == "esc" {
 				m.filter.SetValue("")
 			}
-			m.lSel = 0
+			m.lSel, m.vs.lSel = 0, 0
 			return m, m.selChanged()
 		}
 		var cmd tea.Cmd
 		m.filter, cmd = m.filter.Update(k)
-		m.lSel = 0
+		m.lSel, m.vs.lSel = 0, 0
 		return m, cmd
 	}
 	if m.focusDetail || m.full {
@@ -499,6 +534,8 @@ func (m *model) key(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "?":
 		m.modal = modalHelp
 		return m, nil
+	case "v":
+		return m, m.setMode(!m.vn)
 	case "1", "2", "3":
 		return m, m.switchTab(tabID(s[0] - '1'))
 	case "tab":
@@ -513,19 +550,31 @@ func (m *model) key(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	switch m.tab {
-	case tabList:
+	switch {
+	case m.tab == tabList && m.vn:
+		return m, m.vnListKey(s)
+	case m.tab == tabList:
 		return m, m.listKey(s)
-	case tabNow:
+	case m.tab == tabNow && m.vn:
+		return m, m.vnNowKey(s)
+	case m.tab == tabNow:
 		return m, m.nowKey(s)
 	default:
 		return m, m.searchKey(s)
 	}
 }
 
+// hasCurrent says whether something is selected for the detail panel.
+func (m *model) hasCurrent() bool {
+	if m.vn {
+		return m.vnCurrent() != nil
+	}
+	return m.current() != nil
+}
+
 // openDetail moves keyboard focus into the detail panel (or full screen).
 func (m *model) openDetail() tea.Cmd {
-	if m.current() == nil {
+	if !m.hasCurrent() {
 		return nil
 	}
 	if m.wide() {
@@ -539,12 +588,18 @@ func (m *model) openDetail() tea.Cmd {
 
 func (m *model) closeDetail() {
 	m.focusDetail, m.full, m.peek, m.dScroll, m.link = false, false, nil, 0, 0
+	m.vs.peek = nil
 }
 
 func (m *model) detailKey(s string) (tea.Cmd, bool) {
 	switch s {
 	case "esc", "backspace", "h", "left":
-		if n := len(m.peek); n > 0 {
+		if n := len(m.vs.peek); m.vn && n > 0 {
+			m.vs.peek = m.vs.peek[:n-1]
+			m.link, m.dScroll = 0, 0
+			return m.selChanged(), true
+		}
+		if n := len(m.peek); !m.vn && n > 0 {
 			m.peek = m.peek[:n-1]
 			m.link, m.dScroll = 0, 0
 			return m.selChanged(), true
@@ -659,6 +714,9 @@ func (m *model) listKey(s string) tea.Cmd {
 // ---------------------------------------------------------------- actions
 
 func (m *model) actionKey(s string) (tea.Cmd, bool) {
+	if m.vn {
+		return m.vnActionKey(s)
+	}
 	r := m.current()
 	if r == nil {
 		return nil, false
@@ -799,7 +857,11 @@ func (m *model) modalKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if s == "esc" || (m.modal == modalHelp && (s == "?" || s == "q" || s == "enter")) {
 		m.modal = modalNone
 		m.modalInput.Blur()
+		m.modalInput.CharLimit = 8
 		return m, nil
+	}
+	if m.vn {
+		return m.vnModalKey(k)
 	}
 	r := m.current()
 	switch m.modal {

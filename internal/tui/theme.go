@@ -34,6 +34,7 @@ var (
 	sHead   = lipgloss.NewStyle().Foreground(cAccent2).Bold(true)
 	sTabOn  = lipgloss.NewStyle().Foreground(lipgloss.Color("0")).Background(cAccent).Bold(true).Padding(0, 1)
 	sTabOff = lipgloss.NewStyle().Foreground(cDim).Padding(0, 1)
+	sModeOn = lipgloss.NewStyle().Foreground(lipgloss.Color("0")).Background(cAccent2).Bold(true).Padding(0, 1)
 	sKey    = lipgloss.NewStyle().Foreground(cAccent).Bold(true)
 	sLink   = lipgloss.NewStyle().Foreground(cAccent).Underline(true)
 	sLinkOn = lipgloss.NewStyle().Foreground(lipgloss.Color("0")).Background(cAccent).Bold(true)

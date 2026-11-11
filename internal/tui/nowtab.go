@@ -113,9 +113,9 @@ func (m *model) changeMatch(p *daemon.NowPlaying) tea.Cmd {
 }
 
 func (m *model) resolvePending(p *store.Pending) tea.Cmd {
-	if p.Kind != "anime" {
-		m.flash("visual novels: use `anisync resolve` (VNDB search)", true)
-		return nil
+	if p.Kind == "vn" {
+		cmd := m.setMode(true)
+		return tea.Batch(cmd, m.vnStartResolve(p.Key, cleanFolder(p.Query)))
 	}
 	q := reSeasonSuffix(p.Query)
 	return m.startResolve(p.Key, q, 0)

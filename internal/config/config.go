@@ -50,6 +50,9 @@ type Config struct {
 	NotifyUpdates bool `toml:"notify_updates"`
 	// Cover art in the TUI (kitty / Ghostty graphics protocol).
 	Covers bool `toml:"covers"`
+	// VN covers in the TUI: "safe" hides covers VNDB rates as sexual or
+	// brutal, "all" shows every cover, "off" shows none.
+	VNCovers string `toml:"vn_covers"`
 
 	AniList struct {
 		ClientID string `toml:"client_id"`
@@ -83,6 +86,7 @@ func Default() Config {
 	c.Notify = true
 	c.NotifyUpdates = true
 	c.Covers = true
+	c.VNCovers = "safe"
 	c.AniList.Enabled = true
 	c.MAL.Enabled = true
 	c.MAL.RedirectPort = 8789
@@ -126,6 +130,13 @@ func Load() (Config, error) {
 	}
 	if c.Threshold <= 0 || c.Threshold > 1 {
 		return c, fmt.Errorf("threshold must be in (0,1], got %v", c.Threshold)
+	}
+	switch c.VNCovers {
+	case "safe", "all", "off":
+	case "":
+		c.VNCovers = "safe"
+	default:
+		return c, fmt.Errorf("vn_covers must be \"safe\", \"all\" or \"off\", got %q", c.VNCovers)
 	}
 	if c.VNDB.ScanInterval.Duration < 5*time.Second {
 		c.VNDB.ScanInterval.Duration = 5 * time.Second
@@ -188,6 +199,9 @@ notify_updates = true  # also notify on every successful update
 
 # Cover art in "anisync tui" (kitty or Ghostty; detected automatically).
 covers = true
+# Visual novel covers: "safe" hides covers VNDB flags as sexual or brutal
+# (shows a placeholder), "all" shows every cover, "off" shows none.
+vn_covers = "safe"
 
 [anilist]
 enabled = true

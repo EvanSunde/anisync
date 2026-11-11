@@ -68,9 +68,11 @@ type Item struct {
 	SetProgress int    `json:"set_progress,omitempty"`
 	SetScore    int    `json:"set_score,omitempty"` // 0-100
 	SetDelete   bool   `json:"set_delete,omitempty"`
-	// Display data (a listcache.Entry) so the local list can show a show
-	// added while offline.
+	// Display data (a listcache.Entry, or a vnlist.Entry for kind "vnset")
+	// so the local list can show an entry added while offline.
 	Meta json.RawMessage `json:"meta,omitempty"`
+	// kind "vnset": a manual VNDB list edit from the TUI.
+	VNEdit *VNEdit `json:"vn_edit,omitempty"`
 
 	// Filled in once resolved; kept so a half-applied update (AniList ok,
 	// MAL offline) resumes where it stopped.
@@ -81,12 +83,34 @@ type Item struct {
 	TargetTotal int                      `json:"target_total,omitempty"`
 	TargetTitle string                   `json:"target_title,omitempty"`
 	Before      map[string]EntrySnapshot `json:"before,omitempty"`
+	BeforeVN    *VNSnapshot              `json:"before_vn,omitempty"`
 	Result      map[string]string        `json:"result,omitempty"`
 
 	Created  time.Time       `json:"created"`
 	Done     map[string]bool `json:"done,omitempty"` // per service
 	Attempts int             `json:"attempts,omitempty"`
 	LastErr  string          `json:"last_error,omitempty"`
+}
+
+// VNEdit is a change to a VNDB list entry. Nil fields stay unchanged.
+type VNEdit struct {
+	LabelsSet   []int   `json:"labels_set,omitempty"`
+	LabelsUnset []int   `json:"labels_unset,omitempty"`
+	Vote        *int    `json:"vote,omitempty"`     // 10-100; 0 clears
+	Started     *string `json:"started,omitempty"`  // YYYY-MM-DD; "" clears
+	Finished    *string `json:"finished,omitempty"` // YYYY-MM-DD; "" clears
+	Notes       *string `json:"notes,omitempty"`
+	Delete      bool    `json:"delete,omitempty"`
+}
+
+// VNSnapshot is a VNDB list entry (before an update, for undo).
+type VNSnapshot struct {
+	Exists   bool   `json:"exists"`
+	Labels   []int  `json:"labels,omitempty"`
+	Vote     int    `json:"vote,omitempty"`
+	Started  string `json:"started,omitempty"`
+	Finished string `json:"finished,omitempty"`
+	Notes    string `json:"notes,omitempty"`
 }
 
 // EntrySnapshot is a service list entry before an update, for undo.
@@ -113,6 +137,7 @@ type HistoryEntry struct {
 	Action    string                   `json:"action,omitempty"`
 	Result    map[string]string        `json:"result"` // service -> "progress 4→5" / "skipped: ..."
 	Before    map[string]EntrySnapshot `json:"before,omitempty"`
+	BeforeVN  *VNSnapshot              `json:"before_vn,omitempty"`
 	Undone    bool                     `json:"undone,omitempty"`
 }
 

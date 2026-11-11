@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,6 +33,7 @@ import (
 	"github.com/evansunde/anisync/internal/mal"
 	"github.com/evansunde/anisync/internal/store"
 	"github.com/evansunde/anisync/internal/vndb"
+	"github.com/evansunde/anisync/internal/vnlist"
 )
 
 func vndbAPI(u string) { vndb.API = u }
@@ -510,6 +512,159 @@ func TestEndToEnd(t *testing.T) {
 	}
 }
 
+// vndbMock is a small stateful VNDB: search, details, the user's list with
+// labels, PATCH and DELETE.
+type vndbMock struct {
+	mu      sync.Mutex
+	down    atomic.Bool
+	entries map[string]map[string]any // vid -> ulist entry fields
+	patches map[string][]map[string]any
+}
+
+var vnCatalog = map[string]map[string]any{
+	"v20424": {"id": "v20424", "title": "Summer Pockets", "alttitle": "サマーポケッツ", "released": "2018-06-29", "rating": 84.6, "votecount": 4000,
+		"length": 5, "length_minutes": 3245, "image": map[string]any{"url": "https://t.vndb.org/cv/08/75908.jpg", "sexual": 0, "violence": 0},
+		"developers": []any{map[string]any{"id": "p24", "name": "Key"}}, "titles": []any{}},
+	"v50957": {"id": "v50957", "title": "Summer Pockets: Xiari", "titles": []any{}},
+	"v17": {"id": "v17", "title": "Ever17", "released": "2002-08-29", "rating": 87, "votecount": 9000, "length": 4, "titles": []any{},
+		"image": map[string]any{"url": "https://t.vndb.org/cv/1.jpg", "sexual": 0, "violence": 0}},
+}
+
+var vnLabels = map[int]string{1: "Playing", 2: "Finished", 3: "Stalled", 4: "Dropped", 5: "Wishlist", 6: "Blacklist", 7: "Voted", 10: "Favourites"}
+
+func (v *vndbMock) labelsOf(e map[string]any, withNames bool) []any {
+	ids, _ := e["labels"].([]int)
+	out := []any{}
+	for _, id := range ids {
+		l := map[string]any{"id": id}
+		if withNames {
+			l["label"] = vnLabels[id]
+		}
+		out = append(out, l)
+	}
+	return out
+}
+
+func (v *vndbMock) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if v.down.Load() {
+		http.Error(w, "down", 503)
+		return
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	var body map[string]any
+	if r.Body != nil {
+		json.NewDecoder(r.Body).Decode(&body)
+	}
+	filterID := func() string {
+		if f, ok := body["filters"].([]any); ok && len(f) == 3 && f[0] == "id" {
+			return f[2].(string)
+		}
+		return ""
+	}
+	switch {
+	case r.URL.Path == "/vn":
+		if id := filterID(); id != "" {
+			json.NewEncoder(w).Encode(map[string]any{"results": []any{vnCatalog[id]}})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"results": []any{vnCatalog["v20424"], vnCatalog["v50957"]}, "more": false, "count": 2})
+	case r.URL.Path == "/ulist_labels":
+		var ls []any
+		for id, name := range vnLabels {
+			n := 0
+			for _, e := range v.entries {
+				for _, l := range e["labels"].([]int) {
+					if l == id {
+						n++
+					}
+				}
+			}
+			ls = append(ls, map[string]any{"id": id, "label": name, "private": false, "count": n})
+		}
+		json.NewEncoder(w).Encode(map[string]any{"labels": ls})
+	case r.URL.Path == "/ulist" && r.Method == http.MethodPost:
+		var res []any
+		if id := filterID(); id != "" {
+			if e := v.entries[id]; e != nil {
+				res = append(res, map[string]any{"id": id, "labels": v.labelsOf(e, false), "vote": e["vote"], "started": e["started"],
+					"finished": e["finished"], "notes": e["notes"]})
+			}
+		} else {
+			for id, e := range v.entries {
+				res = append(res, map[string]any{"id": id, "labels": v.labelsOf(e, true), "vote": e["vote"], "started": e["started"],
+					"finished": e["finished"], "notes": e["notes"], "lastmod": 1, "added": 1, "vn": vnCatalog[id]})
+			}
+		}
+		json.NewEncoder(w).Encode(map[string]any{"results": res, "more": false})
+	case strings.HasPrefix(r.URL.Path, "/ulist/"):
+		id := strings.TrimPrefix(r.URL.Path, "/ulist/")
+		if r.Method == http.MethodDelete {
+			delete(v.entries, id)
+			w.WriteHeader(204)
+			return
+		}
+		v.patches[id] = append(v.patches[id], body)
+		e := v.entries[id]
+		if e == nil {
+			e = map[string]any{"labels": []int{}}
+			v.entries[id] = e
+		}
+		labels := e["labels"].([]int)
+		if l, ok := body["labels_unset"].([]any); ok {
+			var keep []int
+			for _, x := range labels {
+				drop := false
+				for _, u := range l {
+					drop = drop || int(u.(float64)) == x
+				}
+				if !drop {
+					keep = append(keep, x)
+				}
+			}
+			labels = keep
+		}
+		if l, ok := body["labels_set"].([]any); ok {
+			for _, x := range l {
+				labels = append(labels, int(x.(float64)))
+			}
+		}
+		for _, k := range []string{"vote", "started", "finished", "notes"} {
+			if val, ok := body[k]; ok {
+				e[k] = val
+			}
+		}
+		withoutVoted := []int{}
+		for _, x := range labels {
+			if x != 7 {
+				withoutVoted = append(withoutVoted, x)
+			}
+		}
+		if e["vote"] != nil {
+			withoutVoted = append(withoutVoted, 7)
+		}
+		e["labels"] = withoutVoted
+		w.WriteHeader(204)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (v *vndbMock) entry(id string) (map[string]any, bool) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	e, ok := v.entries[id]
+	if !ok {
+		return nil, false
+	}
+	cp := map[string]any{}
+	for k, x := range e {
+		cp[k] = x
+	}
+	sort.Ints(cp["labels"].([]int))
+	return cp, true
+}
+
 func TestVisualNovel(t *testing.T) {
 	if os.Getenv("DBUS_SESSION_BUS_ADDRESS") == "" {
 		t.Skip("needs a session bus")
@@ -519,28 +674,15 @@ func TestVisualNovel(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", filepath.Join(tmp, "state"))
 	t.Setenv("XDG_RUNTIME_DIR", tmp)
 
-	var mu sync.Mutex
-	patches := map[string][]map[string]any{}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		defer mu.Unlock()
-		switch {
-		case r.URL.Path == "/vn":
-			fmt.Fprint(w, `{"results":[{"id":"v20424","title":"Summer Pockets","alttitle":"サマーポケッツ","released":"2018-06-29","titles":[]},{"id":"v50957","title":"Summer Pockets: Xiari","titles":[]}]}`)
-		case r.URL.Path == "/ulist" && r.Method == http.MethodPost:
-			fmt.Fprint(w, `{"results":[]}`)
-		case strings.HasPrefix(r.URL.Path, "/ulist/"):
-			var body map[string]any
-			json.NewDecoder(r.Body).Decode(&body)
-			id := strings.TrimPrefix(r.URL.Path, "/ulist/")
-			patches[id] = append(patches[id], body)
-			w.WriteHeader(204)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
+	vm := &vndbMock{entries: map[string]map[string]any{}, patches: map[string][]map[string]any{}}
+	srv := httptest.NewServer(vm)
 	defer srv.Close()
 	vndbAPI(srv.URL)
+	patches := func(id string) []map[string]any {
+		vm.mu.Lock()
+		defer vm.mu.Unlock()
+		return append([]map[string]any(nil), vm.patches[id]...)
+	}
 
 	var tok store.Tokens
 	tok.VNDB.Token, tok.VNDB.UserID, tok.VNDB.User = "t", "u1", "tester"
@@ -565,21 +707,23 @@ func TestVisualNovel(t *testing.T) {
 	sock := config.SocketPath()
 	waitFor(t, "daemon", 5*time.Second, func() bool { return ipc.Call(sock, "status", nil, nil) == nil })
 
-	cmd := exec.Command(bin, "3")
+	cmd := exec.Command(bin, "4")
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "marked playing", 10*time.Second, func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		p := patches["v20424"]
+		p := patches("v20424")
 		return len(p) >= 1 && fmt.Sprint(p[0]["labels_set"]) == "[1]" && p[0]["started"] != nil
+	})
+	// the running VN is in the status (TUI Now tab)
+	waitFor(t, "running VN in status", 5*time.Second, func() bool {
+		var st daemon.Status
+		ipc.Call(sock, "status", nil, &st)
+		return len(st.VNNow) == 1 && st.VNNow[0].VNDBID == "v20424" && st.VNNow[0].Session > 0
 	})
 	cmd.Wait()
 	waitFor(t, "playtime note", 10*time.Second, func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		for _, p := range patches["v20424"] {
+		for _, p := range patches("v20424") {
 			if n, ok := p["notes"].(string); ok && strings.HasPrefix(n, "Playtime: 0h") {
 				return true
 			}
@@ -591,9 +735,7 @@ func TestVisualNovel(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, "finished with vote", 10*time.Second, func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		for _, p := range patches["v20424"] {
+		for _, p := range patches("v20424") {
 			if fmt.Sprint(p["labels_set"]) == "[2]" && p["vote"] == float64(85) && p["finished"] != nil {
 				return true
 			}
@@ -605,5 +747,95 @@ func TestVisualNovel(t *testing.T) {
 	t.Logf("vn list: %+v", l)
 	if len(l) != 1 || l[0].Playtime < 2*time.Second {
 		t.Fatalf("playtime not recorded: %+v", l)
+	}
+
+	// --- the local VN list (what the TUI shows)
+	t.Log("vnlist-refresh: labels, entries and local playtime")
+	var rep daemon.VNListReply
+	if err := ipc.Call(sock, "vnlist-refresh", nil, &rep); err != nil || rep.Error != "" {
+		t.Fatalf("vnlist-refresh: %v %s", err, rep.Error)
+	}
+	e := rep.List.Find("v20424")
+	if e == nil || !e.Has(2) || e.Has(1) || e.Vote != 85 || e.Playtime < 2 || e.Title != "Summer Pockets" || e.Cover == "" {
+		t.Fatalf("list entry: %+v", e)
+	}
+	if rep.List.LabelName(10) != "Favourites" || len(rep.List.Labels) != len(vnLabels) {
+		t.Fatalf("labels: %+v", rep.List.Labels)
+	}
+	if fl, err := vnlist.Load(); err != nil || fl.Find("v20424") == nil {
+		t.Fatalf("vnlist.json not written: %v", err)
+	}
+
+	// --- TUI edits through the daemon queue
+	vnset := func(a daemon.VNSetArgs) {
+		t.Helper()
+		var id int64
+		if err := ipc.Call(sock, "vnset", a, &id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	server := func(what string, f func(e map[string]any, ok bool) bool) {
+		t.Helper()
+		waitFor(t, what, 10*time.Second, func() bool { e, ok := vm.entry("v17"); return f(e, ok) })
+	}
+	meta := &vnlist.Entry{ID: "v17", Title: "Ever17", Rating: 87}
+	t.Log("add to wishlist")
+	vnset(daemon.VNSetArgs{ID: "v17", Title: "Ever17", Meta: meta, VNEdit: store.VNEdit{LabelsSet: []int{5}}})
+	server("wishlist", func(e map[string]any, ok bool) bool { return ok && fmt.Sprint(e["labels"]) == "[5]" })
+	t.Log("vote + custom label")
+	v90 := 90
+	vnset(daemon.VNSetArgs{ID: "v17", Title: "Ever17", VNEdit: store.VNEdit{Vote: &v90, LabelsSet: []int{10}}})
+	server("vote 9 and favourite", func(e map[string]any, ok bool) bool {
+		return e["vote"] == float64(90) && fmt.Sprint(e["labels"]) == "[5 7 10]"
+	})
+	t.Log("undo the vote")
+	var h store.HistoryEntry
+	if err := ipc.Call(sock, "undo", int64(0), &h); err != nil {
+		t.Fatal(err)
+	}
+	server("undone", func(e map[string]any, ok bool) bool { return e["vote"] == nil && fmt.Sprint(e["labels"]) == "[5]" })
+	t.Log("remove, then undo the removal")
+	vnset(daemon.VNSetArgs{ID: "v17", Title: "Ever17", VNEdit: store.VNEdit{Delete: true}})
+	server("removed", func(e map[string]any, ok bool) bool { return !ok })
+	if err := ipc.Call(sock, "undo", int64(0), &h); err != nil {
+		t.Fatal(err)
+	}
+	server("restored", func(e map[string]any, ok bool) bool { return ok && fmt.Sprint(e["labels"]) == "[5]" })
+
+	t.Log("offline edit: pending in the local list, applied when back")
+	vm.down.Store(true)
+	today := time.Now().Format("2006-01-02")
+	vnset(daemon.VNSetArgs{ID: "v17", Title: "Ever17", VNEdit: store.VNEdit{LabelsSet: []int{1}, LabelsUnset: []int{5}}})
+	var off daemon.VNListReply
+	ipc.Call(sock, "vnlist", nil, &off)
+	if e := off.List.Find("v17"); e == nil || !e.Pending || !e.Has(1) || e.Has(5) || e.Started != today {
+		t.Fatalf("offline edit not in local list: %+v", e)
+	}
+	if fl, _ := vnlist.Load(); fl.Find("v17") == nil || !fl.Find("v17").Pending {
+		t.Fatal("offline edit not saved to disk")
+	}
+	vm.down.Store(false)
+	ipc.Call(sock, "sync", nil, nil)
+	server("applied after reconnect", func(e map[string]any, ok bool) bool {
+		return fmt.Sprint(e["labels"]) == "[1]" && e["started"] == today
+	})
+	waitFor(t, "local entry confirmed", 10*time.Second, func() bool {
+		var rep daemon.VNListReply // fresh: decoding into a reused value keeps stale omitempty fields
+		ipc.Call(sock, "vnlist", nil, &rep)
+		e := rep.List.Find("v17")
+		return e != nil && !e.Pending
+	})
+	// bad input is rejected up front
+	bad := 5
+	if err := ipc.Call(sock, "vnset", daemon.VNSetArgs{ID: "v17", VNEdit: store.VNEdit{Vote: &bad}}, nil); err == nil {
+		t.Fatal("vote 0.5 accepted")
+	}
+	if err := ipc.Call(sock, "vnset", daemon.VNSetArgs{ID: "17"}, nil); err == nil {
+		t.Fatal("bad id accepted")
+	}
+	var st daemon.Status
+	ipc.Call(sock, "status", nil, &st)
+	if len(st.Queue) != 0 {
+		t.Fatalf("queue not empty: %+v", st.Queue[0])
 	}
 }

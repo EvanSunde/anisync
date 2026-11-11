@@ -14,8 +14,9 @@ import (
 
 // dlink is a clickable thing in the detail panel.
 type dlink struct {
-	kind   string // genre | tag | media
+	kind   string // genre | tag | media | vtag | vn
 	value  string
+	vid    string // VNDB id (vtag, vn)
 	id     int
 	format string
 	line   int
@@ -25,6 +26,8 @@ type dlink struct {
 // the current filters), shows open in the detail panel.
 func (m *model) activate(l dlink, add bool) tea.Cmd {
 	switch l.kind {
+	case "vtag", "vn":
+		return m.vnActivate(l, add)
 	case "genre", "tag":
 		f := anilist.Filter{Sort: []string{"POPULARITY_DESC"}}
 		if add {
@@ -300,7 +303,13 @@ func (m *model) detailBlock(r row, w, h int) block {
 		}
 	}
 
-	// link positions for keyboard navigation
+	return m.finishDetail(b, links, h, w)
+}
+
+// finishDetail records link positions for keyboard navigation, keeps the
+// selected link visible and returns the scrolled window.
+func (m *model) finishDetail(b block, links []dlink, h, w int) block {
+	focused := m.focusDetail || m.full
 	for _, h := range b.hits {
 		if h.tag > 0 && h.tag-1 < len(links) {
 			links[h.tag-1].line = h.y

@@ -8,6 +8,7 @@ import (
 	"github.com/evansunde/anisync/internal/listcache"
 	"github.com/evansunde/anisync/internal/netx"
 	"github.com/evansunde/anisync/internal/store"
+	"github.com/evansunde/anisync/internal/vnlist"
 )
 
 // The daemon owns listcache: refreshed from the server, and every queued
@@ -96,6 +97,24 @@ func (d *Daemon) overlay(it *store.Item) {
 	case it.Kind == "anime" && it.TargetID != 0:
 		d.cacheUpdate(metaOf(it), true, func(cur store.EntrySnapshot) (store.EntrySnapshot, bool, bool) {
 			next, skip := plan(cur, it.TargetTotal, it.TargetEp, d.cfg.AddToList, d.cfg.Rewatch, today)
+			return next, false, skip == ""
+		})
+	case it.Kind == "vnset":
+		d.vnCacheUpdate(vnMetaOf(it), true, func(cur store.VNSnapshot) (store.VNSnapshot, bool, bool) {
+			next, del, skip := ApplyVNEdit(cur, it.VNEdit, today)
+			return next, del, skip == "" || del
+		})
+	case it.Kind == "vn" && (it.Action == "start" || it.Action == "finish"):
+		vid, title := d.vnTarget(it)
+		if vid == "" {
+			return
+		}
+		d.vnCacheUpdate(vnlist.Entry{ID: vid, Title: title}, true, func(cur store.VNSnapshot) (store.VNSnapshot, bool, bool) {
+			e, _ := vnActionEdit(it, cur, today)
+			if e == nil {
+				return cur, false, false
+			}
+			next, _, skip := ApplyVNEdit(cur, e, today)
 			return next, false, skip == ""
 		})
 	}

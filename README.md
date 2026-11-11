@@ -15,6 +15,7 @@ A small background daemon that updates **AniList** and **MyAnimeList** (at the s
 - **TUI (`anisync tui`).** Your list (works offline from a local copy), what's playing now with "mark watched" and "change match", and AniList search with a clickable filter editor. Details include **cover art in kitty/Ghostty**, rankings, genres, tags, related shows and recommendations, all clickable. It works with the mouse or the keyboard.
 - **Local copy of your list.** It's refreshed every 6 hours, and queued (offline) changes are applied to it right away, so both the TUI and title matching work offline.
 - **VNDB (optional, off by default).** It detects a running VN from your VN folders (native or Wine/Proton), marks it *Playing*, tracks playtime, and can write it into your list notes. `anisync vn finish -vote 8.5` marks it finished.
+- **VN mode in the TUI.** Press `v` to switch the TUI to visual novels: your VNDB list by your own labels (custom ones included) with local playtime, running VNs with "finish" and "change match", and VNDB search with the same filter chips and editor. Covers flagged as sexual or brutal are hidden by default.
 
 ## Install
 
@@ -91,7 +92,7 @@ If you don't use systemd user services, start `anisync daemon` from your composi
 Just watch things. When the threshold is reached you get a notification such as *"Sousou no Frieren — episode 5/28 · AniList: progress 4 → 5 · MAL: progress 4 → 5"*.
 
 ```
-anisync tui               search, details with covers, your list, pick matches (see below)
+anisync tui [vn]          search, details with covers, your list, pick matches (see below); vn starts in VN mode
 anisync status            services, what each player is playing and how much is watched, queued updates
 anisync resolve           choose the right show for titles that couldn't be matched automatically
 anisync map "Show" https://anilist.co/anime/123 [-season 2] [-offset -12]
@@ -99,10 +100,11 @@ anisync map "Show" https://anilist.co/anime/123 [-season 2] [-offset -12]
 anisync forget "Show"     drop a wrong mapping so the next episode is matched again
 anisync mappings          list remembered title → show mappings
 anisync history [N]       recent updates (with IDs)
-anisync undo [ID]         revert the last (or given) update on AniList and MAL
+anisync undo [ID]         revert the last (or given) update on AniList and MAL (or a VNDB list change)
 anisync sync              retry the queue now and refresh your lists
 anisync vn list           visual novels with playtime
 anisync vn finish [name] [-vote 8.5]
+anisync vn tui            the TUI in visual novel mode
 ```
 
 `resolve` accepts a number, `s` to search another title, `i` to paste an AniList ID/URL or a MAL URL, or `x` to always ignore that title (e.g. non-anime videos).
@@ -183,6 +185,7 @@ list:no                              only shows that aren't on your list
 | `/` · `f` · `S` · `X` | type a query / filter the list · filter editor · sort · clear filters |
 | `u` · `m` | (Now) mark watched now · change match |
 | `J` `K` | scroll details · `o`/`O` open on AniList/MAL · `ctrl+r` sync · `?` help · `q` quit |
+| `v` | switch between anime and visual novels (see [VN mode](#vn-mode-vndb)) |
 
 Edits go **through the daemon**:
 - They show in your local list immediately (⇅), are queued offline, and are applied to AniList and MAL together.
@@ -195,7 +198,54 @@ Edits go **through the daemon**:
 - They're cached in `~/.cache/anisync/covers`.
 - Turn them off with `covers = false`, or force them with `ANISYNC_COVERS=1`/`0`.
 
-**Your list** is read from AniList if you're logged in there, otherwise from MAL through the daemon. It's stored in `~/.local/state/anisync/list.json`, and the daemon refreshes it every 6 hours or when you press `ctrl+r`.
+**Your list** is read from AniList if you're logged in there, otherwise from MAL through the daemon. It's stored in `~/.local/state/anisync/list.json`, and the daemon refreshes it every 6 hours or when you press `ctrl+r`. Your VNDB list is stored the same way in `vnlist.json` next to it.
+
+### VN mode (VNDB)
+
+Press `v`, or click **Anime │ VN** in the header, to switch the whole TUI to visual novels. `anisync tui vn` starts in it. The three tabs and the detail panel work the same way as for anime.
+
+**1 · My list** is your VNDB list.
+- Sections come from **your labels**: Playing, Finished, Stalled, Dropped, Wishlist, then your custom labels (and Blacklist/Voted when you use them), then All.
+- Rows show the label, your vote, the VNDB rating, the length, **playtime tracked by anisync** (⏱) and your start/finish dates.
+- It's read from a local copy, `~/.local/state/anisync/vnlist.json`, so it opens instantly and works offline. The daemon owns the file like the anime list, refreshes it every 6 hours or on `ctrl+r`, and applies queued edits to it right away (⇅).
+- `h`/`l` switch labels, `/` filters (title or developer), `S` sorts (recently updated, title, your vote, rating, released, playtime).
+
+**2 · Now** shows running visual novels from your `[vndb] dirs`: the folder, the VN it's matched to, this session's length and your total playtime.
+- `f` **marks it finished** and asks for your vote (enter skips the vote).
+- `m` **changes the match**: it opens a VNDB search, you pick the right VN, and queued updates follow.
+- VN folders that couldn't be matched are listed below; `enter` picks one, `x` ignores it.
+
+**3 · Search** is live VNDB search with the same chips and filter editor (`f`): sort, tags (include/exclude), length, release year, rating, votes, language, original language, platform and developer.
+
+```
+summer pockets                       title (any language or alias)
+t:"male protagonist" -t:nukige       tags (all must match); - excludes
+len:short,medium                     length: vshort short medium long vlong
+y:2015-2020   y:>2018                release year
+rating>7.5   rating:70-90            VNDB rating (0-10 or 10-100)
+votes>100                            number of votes
+lang:en,ja   ol:ja                   available languages · original language
+p:win,lin                            platform: win lin mac web and ios swi ps4 ps5 psv …
+dev:key   dev:"type-moon"            developer
+sort:match|rating|votes|new|old|title|worst|obscure
+```
+
+**Details** show the cover, titles, developers, release date, rating and votes, length, platforms and languages, your labels, vote, dates, playtime and notes, tags (no spoilers), the description (VNDB formatting and spoilers stripped) and related VNs.
+- **Tags and related VNs are links.** A tag starts a search (ctrl/alt-click or `A` adds it to your filters), and a related VN opens in place (`esc` goes back).
+
+| key (VN mode) | action |
+|---|---|
+| `s` | label picker: `p` Playing, `f` Finished, `s` Stalled, `d` Dropped, `w` Wishlist (these replace each other), `1`–`9` toggle your custom labels, `x` remove from list |
+| `r` | your vote (1–10, e.g. 8.5; `0` clears) |
+| `e` · `E` | started · finished date (`YYYY-MM-DD`, `today`, or `-` to clear) |
+| `o` | open on vndb.org |
+
+Setting *Playing* fills in the start date and *Finished* the finish date, if they're empty. VN edits go through the daemon queue like anime edits: they work offline and `anisync undo` reverts them. The daemon needs `[vndb] enabled = true` and `anisync auth vndb`.
+
+**VN covers** follow `vn_covers` in the config:
+- `"safe"` (default) hides covers that VNDB rates as sexual (≥ 1, suggestive or explicit) or brutal (violence 2). A placeholder is shown instead, and tags in the *ero* category are left out of the tag list.
+- `"all"` shows every cover and tag.
+- `"off"` shows no VN covers.
 
 ## How it decides
 
@@ -226,7 +276,8 @@ MAL IDs come from AniList, so a single match updates both sites.
 | `~/.config/anisync/tokens.json` | login tokens (mode 600) |
 | `~/.local/state/anisync/state.json` | queue, mappings, pending choices, history, watch coverage, VN playtime |
 | `~/.local/state/anisync/list.json` | local copy of your list (offline view and matching) |
-| `~/.cache/anisync/` | TUI cover images, genre/tag names |
+| `~/.local/state/anisync/vnlist.json` | local copy of your VNDB list (VN mode) |
+| `~/.cache/anisync/` | TUI cover images, genre/tag names, VNDB tag names |
 
 Logs: `journalctl --user -u anisync -f`
 
@@ -253,4 +304,4 @@ make test
 make e2e
 ```
 
-`make e2e` runs the real daemon on a private D-Bus session, with a fake MPRIS player and mock AniList/MAL/VNDB servers. There's also `go test -tags live ./internal/daemon/ -run Live -v`, which checks matching against the real AniList API.
+`make e2e` runs the real daemon on a private D-Bus session, with a fake MPRIS player and mock AniList/MAL/VNDB servers. There's also `go test -tags live ./internal/daemon/ -run Live -v`, which checks matching against the real AniList API, and `go test -tags live ./internal/vndb/ -v`, which checks VN search, details, tags and labels against the real VNDB API.

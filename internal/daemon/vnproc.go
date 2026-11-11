@@ -12,6 +12,7 @@ import (
 	"github.com/evansunde/anisync/internal/netx"
 	"github.com/evansunde/anisync/internal/store"
 	"github.com/evansunde/anisync/internal/vndb"
+	"github.com/evansunde/anisync/internal/vnlist"
 )
 
 func (d *Daemon) onVNStart(key, folder string) {
@@ -24,14 +25,18 @@ func (d *Daemon) onVNStart(key, folder string) {
 	}
 	e.LastPlayed = time.Now()
 	queue := !e.Started
+	var it *store.Item
 	if queue {
 		e.Started = true
-		d.st.S.Queue = append(d.st.S.Queue, &store.Item{ID: d.st.NewID(), Kind: "vn", Key: k, Title: folder, Action: "start", Created: time.Now()})
+		it = &store.Item{ID: d.st.NewID(), Kind: "vn", Key: k, Title: folder, Action: "start", Created: time.Now()}
+		d.st.S.Queue = append(d.st.S.Queue, it)
 	}
 	_ = d.st.Save()
 	d.st.Unlock()
 	log.Printf("vn: playing %s", folder)
 	if queue {
+		cp := *it
+		d.overlay(&cp)
 		d.Kick()
 	}
 }
@@ -60,6 +65,7 @@ func (d *Daemon) onVNStop(key, folder string, dur time.Duration) {
 	_ = d.st.Save()
 	d.st.Unlock()
 	log.Printf("vn: stopped %s after %s (total %s)", folder, dur.Round(time.Second), e.Playtime.Round(time.Second))
+	d.vnCachePlaytime()
 	if d.cfg.VNDB.PlaytimeNote && !queued {
 		d.Kick()
 	}
@@ -129,44 +135,27 @@ func (d *Daemon) processVN(ctx context.Context, it *store.Item) error {
 	if it.Result == nil {
 		it.Result = map[string]string{}
 	}
-	d.tokMu.Lock()
-	uid := d.tok.VNDB.UserID
-	d.tokMu.Unlock()
-	cur, err := d.vndb.Entry(ctx, uid, m.VNDBID)
+	u, err := d.vndb.Entry(ctx, d.vnUser(), m.VNDBID)
 	if err != nil {
 		return d.vnErr(err)
 	}
+	cur := vnSnap(u)
 	today := netx.Today()
-	patch := map[string]any{}
+	var e *store.VNEdit
+	var result string
 	switch it.Action {
-	case "start":
-		if cur.Has(vndb.Finished) {
-			it.Result[svcVNDB] = "skipped (already finished)"
+	case "start", "finish":
+		var skip string
+		if e, skip = vnActionEdit(it, cur, today); e == nil {
+			it.Result[svcVNDB] = "skipped (" + skip + ")"
 			return nil
 		}
-		if !cur.Has(vndb.Playing) {
-			patch["labels_set"] = []int{vndb.Playing}
-			patch["labels_unset"] = []int{vndb.Wishlist, vndb.Stalled}
-		}
-		if cur == nil || cur.Started == nil || *cur.Started == "" {
-			patch["started"] = today
-		}
-		it.Result[svcVNDB] = "marked playing"
-	case "finish":
-		patch["labels_set"] = []int{vndb.Finished}
-		patch["labels_unset"] = []int{vndb.Playing, vndb.Stalled, vndb.Dropped, vndb.Wishlist}
-		if cur == nil || cur.Finished == nil || *cur.Finished == "" {
-			patch["finished"] = today
-		}
-		if cur == nil || cur.Started == nil || *cur.Started == "" {
-			patch["started"] = today
-		}
-		if it.Vote >= 10 && it.Vote <= 100 {
-			patch["vote"] = it.Vote
-		}
-		it.Result[svcVNDB] = "marked finished"
-		if it.Vote > 0 {
-			it.Result[svcVNDB] += fmt.Sprintf(", vote %.1f", float64(it.Vote)/10)
+		result = "marked playing"
+		if it.Action == "finish" {
+			result = "marked finished"
+			if it.Vote > 0 {
+				result += fmt.Sprintf(", vote %.1f", float64(it.Vote)/10)
+			}
 		}
 	case "playtime":
 		d.st.Lock()
@@ -176,10 +165,7 @@ func (d *Daemon) processVN(ctx context.Context, it *store.Item) error {
 		}
 		d.st.Unlock()
 		line := fmt.Sprintf("Playtime: %dh %02dm", int(pt.Hours()), int(pt.Minutes())%60)
-		notes := ""
-		if cur != nil && cur.Notes != nil {
-			notes = *cur.Notes
-		}
+		notes := cur.Notes
 		if playtimeLine.MatchString(notes) {
 			notes = playtimeLine.ReplaceAllString(notes, line)
 		} else if notes == "" {
@@ -187,14 +173,24 @@ func (d *Daemon) processVN(ctx context.Context, it *store.Item) error {
 		} else {
 			notes = strings.TrimRight(notes, "\n") + "\n" + line
 		}
-		patch["notes"] = notes
-		it.Result[svcVNDB] = "skipped (" + strings.ToLower(line) + ")" // quiet: no notification
+		e = &store.VNEdit{Notes: &notes}
+		result = "skipped (" + strings.ToLower(line) + ")" // quiet: no notification
+	default:
+		return fmt.Errorf("%w: unknown vn action %q", errDrop, it.Action)
 	}
-	if len(patch) > 0 {
-		if err := d.vndb.Patch(ctx, m.VNDBID, patch); err != nil {
-			return d.vnErr(err)
-		}
+	next, _, skip := ApplyVNEdit(cur, e, today)
+	if skip != "" {
+		it.Result[svcVNDB] = "skipped (" + skip + ")"
+		return nil
 	}
+	if err := d.vndb.Patch(ctx, m.VNDBID, vnPatch(cur, next)); err != nil {
+		return d.vnErr(err)
+	}
+	if it.Action != "playtime" {
+		it.BeforeVN = &cur // undoable
+	}
+	it.Result[svcVNDB] = result
+	d.vnCacheSet(vnlist.Entry{ID: m.VNDBID, Title: m.Title}, next, false, true)
 	return nil
 }
 

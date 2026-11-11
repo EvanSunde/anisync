@@ -64,7 +64,10 @@ type actionMsg struct {
 }
 type tickMsg time.Time
 type debounceMsg struct{ id uint32 }
-type liveSearchMsg struct{ seq int }
+type liveSearchMsg struct {
+	seq int
+	vn  bool
+}
 
 func ctx20() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), 20*time.Second)
@@ -189,8 +192,8 @@ func debounce(id uint32) tea.Cmd {
 	return tea.Tick(180*time.Millisecond, func(time.Time) tea.Msg { return debounceMsg{id: id} })
 }
 
-func liveSearch(seq int) tea.Cmd {
-	return tea.Tick(350*time.Millisecond, func(time.Time) tea.Msg { return liveSearchMsg{seq: seq} })
+func liveSearch(seq int, vn bool) tea.Cmd {
+	return tea.Tick(350*time.Millisecond, func(time.Time) tea.Msg { return liveSearchMsg{seq: seq, vn: vn} })
 }
 
 func setCmd(a daemon.SetArgs, desc string) tea.Cmd {

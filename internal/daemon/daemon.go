@@ -30,6 +30,7 @@ import (
 	"github.com/evansunde/anisync/internal/store"
 	"github.com/evansunde/anisync/internal/vn"
 	"github.com/evansunde/anisync/internal/vndb"
+	"github.com/evansunde/anisync/internal/vnlist"
 )
 
 type Daemon struct {
@@ -59,6 +60,9 @@ type Daemon struct {
 	backoff     time.Duration
 	cache       *listcache.List // local copy of the user's list
 	listFetched time.Time
+	vncache     *vnlist.List // local copy of the user's VNDB list
+	vnFetched   time.Time
+	vnRetry     time.Time
 }
 
 const (
@@ -77,6 +81,7 @@ func Run(cfg config.Config) error {
 		return err
 	}
 	d.loadCache()
+	d.loadVNCache()
 
 	conn, err := dbus.ConnectSessionBus()
 	if err != nil {
@@ -167,7 +172,7 @@ func (d *Daemon) loadTokens() error {
 	}
 	d.stateMu.Lock()
 	d.authBroken = map[string]bool{}
-	d.listFetched = time.Time{}
+	d.listFetched, d.vnFetched, d.vnRetry = time.Time{}, time.Time{}, time.Time{}
 	d.stateMu.Unlock()
 	return nil
 }
@@ -404,6 +409,7 @@ func (d *Daemon) processQueue() time.Duration {
 			return d.fail(err)
 		}
 	}
+	d.maybeRefreshVNList(ctx)
 
 	d.st.Lock()
 	ids := make([]int64, 0, len(d.st.S.Queue))
@@ -423,6 +429,8 @@ func (d *Daemon) processQueue() time.Duration {
 			err = d.processVN(ctx, it)
 		case "set":
 			err = d.processSet(ctx, it)
+		case "vnset":
+			err = d.processVNSet(ctx, it)
 		default:
 			err = d.processAnime(ctx, it)
 		}
@@ -526,13 +534,16 @@ func (d *Daemon) removeItem(id int64) {
 func (d *Daemon) finishItem(it *store.Item) {
 	h := &store.HistoryEntry{ID: it.ID, Time: time.Now(), Kind: it.Kind, Title: firstNonEmpty(it.TargetTitle, it.Title),
 		AnilistID: it.TargetID, MalID: it.TargetMal, VNDBID: it.TargetVN, Episode: it.TargetEp, Action: it.Action,
-		Result: it.Result, Before: it.Before}
+		Result: it.Result, Before: it.Before, BeforeVN: it.BeforeVN}
 	d.st.Lock()
 	d.st.S.History = append(d.st.S.History, h)
 	d.st.Unlock()
 	d.removeItem(it.ID)
-	if it.Kind == "anime" || it.Kind == "set" {
+	switch it.Kind {
+	case "anime", "set":
 		d.cacheClearPending(it.TargetID, it.TargetMal)
+	case "vn", "vnset":
+		d.vnCacheClearPending(it.TargetVN)
 	}
 
 	changed := false
@@ -546,7 +557,7 @@ func (d *Daemon) finishItem(it *store.Item) {
 		}
 	}
 	log.Printf("done: %s — %s", h.Title, strings.Join(parts, "; "))
-	if changed && d.cfg.NotifyUpdates && it.Kind != "set" { // manual edits: you already know
+	if changed && d.cfg.NotifyUpdates && it.Kind != "set" && it.Kind != "vnset" { // manual edits: you already know
 		summary := h.Title
 		if it.Kind == "anime" {
 			if it.TargetTotal > 0 {

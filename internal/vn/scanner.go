@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -22,6 +23,7 @@ type Scanner struct {
 
 	procRoot string
 	seen     map[int]*pidInfo
+	mu       sync.Mutex // guards active (Active is called from other goroutines)
 	active   map[string]*session
 	self     int
 }
@@ -65,6 +67,8 @@ func (s *Scanner) Run(stop <-chan struct{}) {
 
 // Scan runs one detection pass.
 func (s *Scanner) Scan(now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	ents, err := os.ReadDir(s.procRoot)
 	if err != nil {
 		return
@@ -127,6 +131,8 @@ func (s *Scanner) end(key string, ss *session) {
 }
 
 func (s *Scanner) endAll(now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	for key, ss := range s.active {
 		ss.last = now
 		s.end(key, ss)
@@ -135,6 +141,8 @@ func (s *Scanner) endAll(now time.Time) {
 
 // Active returns VN folders currently running with their session length.
 func (s *Scanner) Active() map[string]time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	out := map[string]time.Duration{}
 	for k, ss := range s.active {
 		out[k] = ss.last.Sub(ss.start)

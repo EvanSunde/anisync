@@ -28,17 +28,23 @@ func (m *model) View() string {
 	case m.modal == modalHelp:
 		body.add(m.helpLines()...)
 	case m.full:
-		if r := m.current(); r != nil {
-			body = m.detailBlock(*r, m.w-2, h).shift(1, 0)
+		if d, ok := m.detailPane(m.w-2, h); ok {
+			body = d.shift(1, 0)
 			m.areas = append(m.areas, area{0, bodyTop, m.w, bodyTop + h, m.scrollDetail})
 		}
 	default:
 		var left func(w, h int) block
-		switch m.tab {
-		case tabList:
+		switch {
+		case m.tab == tabList && m.vn:
+			left = m.vnListBlock
+		case m.tab == tabList:
 			left = m.listBlock
-		case tabNow:
+		case m.tab == tabNow && m.vn:
+			left = m.vnNowBlock
+		case m.tab == tabNow:
 			left = m.nowBlock
+		case m.vn:
+			left = m.vnSearchBlock
 		default:
 			left = m.searchBlock
 		}
@@ -78,6 +84,20 @@ func (b block) shift(dx, dy int) block {
 	return out
 }
 
+// detailPane renders the detail of the current show or VN.
+func (m *model) detailPane(w, h int) (block, bool) {
+	if m.vn {
+		if r := m.vnCurrent(); r != nil {
+			return m.vnDetailBlock(*r, w, h), true
+		}
+		return block{}, false
+	}
+	if r := m.current(); r != nil {
+		return m.detailBlock(*r, w, h), true
+	}
+	return block{}, false
+}
+
 func (m *model) scrollDetail(dir int) tea.Cmd {
 	m.dScroll = max(0, m.dScroll+dir*2)
 	return nil
@@ -88,7 +108,8 @@ func (m *model) scrollLeft(dir int) tea.Cmd {
 		if pk := m.panel.picker; pk != nil {
 			pk.sel = max(0, min(len(pk.visible())-1, pk.sel+dir))
 		} else {
-			m.panel.sel = (m.panel.sel + dir + len(fields)) % len(fields)
+			n := len(m.spec().fields())
+			m.panel.sel = (m.panel.sel + dir + n) % n
 		}
 		return nil
 	}
@@ -97,6 +118,19 @@ func (m *model) scrollLeft(dir int) tea.Cmd {
 		k = "k"
 	}
 	m.closeDetail()
+	if m.vn {
+		switch m.tab {
+		case tabList:
+			c, _ := m.move(k, &m.vs.lSel, len(m.vnVisible()))
+			return c
+		case tabNow:
+			c, _ := m.move(k, &m.vs.nSel, m.vnNowCount())
+			return c
+		default:
+			c, _ := m.move(k, &m.vs.sSel, len(m.vs.results))
+			return tea.Batch(c, m.loadMore())
+		}
+	}
 	switch m.tab {
 	case tabList:
 		c, _ := m.move(k, &m.lSel, len(m.visibleList()))
@@ -120,10 +154,7 @@ func (m *model) split(left func(w, h int) block, h int) block {
 	lw := max(56, m.w*55/100)
 	rw := m.w - lw - 3
 	l := left(lw, h)
-	var r block
-	if cur := m.current(); cur != nil {
-		r = m.detailBlock(*cur, rw, h)
-	}
+	r, _ := m.detailPane(rw, h)
 	m.areas = append(m.areas, area{0, bodyTop, lw, bodyTop + h, m.scrollLeft}, area{lw + 1, bodyTop, m.w, bodyTop + h, m.scrollDetail})
 	sep := sDim.Render(" │ ")
 	if m.focusDetail {
@@ -156,7 +187,11 @@ func (m *model) header() string {
 		i := i
 		label := t
 		if tabID(i) == tabNow {
-			if n := len(m.pending); n > 0 {
+			n := len(m.pending)
+			if m.vn {
+				n = len(m.vnPending())
+			}
+			if n > 0 {
 				label += fmt.Sprintf(" (%d)", n)
 			}
 		}
@@ -166,6 +201,15 @@ func (m *model) header() string {
 		}
 		segs = append(segs, seg{text: st.Render(label), click: onClick(func() tea.Cmd { return m.switchTab(tabID(i)) })})
 	}
+	// mode switch
+	modeSeg := func(label string, vn bool) seg {
+		st := sTabOff
+		if m.vn == vn {
+			st = sModeOn
+		}
+		return seg{text: st.Render(label), click: onClick(func() tea.Cmd { return m.setMode(vn) })}
+	}
+	segs = append(segs, txt("  "), modeSeg("Anime", false), txt(sDim.Render("│")), modeSeg("VN", true))
 	var b block
 	b.addSegs(segs...)
 	left := b.lines[0]
@@ -193,6 +237,12 @@ func (m *model) header() string {
 					click: onClick(func() tea.Cmd { return m.switchTab(tabNow) })})
 				break
 			}
+		}
+		for _, v := range m.st.VNNow {
+			right = append(right, seg{text: sOK.Render("▶ ") + ansi.Truncate(firstNonEmpty(v.Title, v.Folder), 28, "…") + " " +
+				sDim.Render(fmtPlaytime(int64(v.Session.Seconds()))) + "  ",
+				click: onClick(func() tea.Cmd { return tea.Batch(m.setMode(true), m.switchTab(tabNow)) })})
+			break
 		}
 		if n := len(m.st.Queue); n > 0 {
 			q := fmt.Sprintf("⇅ %d queued", n)
@@ -225,6 +275,19 @@ func (m *model) header() string {
 func (m *model) footer() []string {
 	y := bodyTop + m.bodyHeight()
 	var line1 block
+	if m.vn && m.modal != modalNone && m.modal != modalHelp {
+		line1 = m.vnFooterLine()
+	} else {
+		m.footerLine(&line1)
+	}
+	for _, x := range line1.hits {
+		x.y = y
+		m.hits = append(m.hits, x)
+	}
+	return []string{fit(line1.lines[0], m.w), fit(" "+m.hint(), m.w)}
+}
+
+func (m *model) footerLine(line1 *block) {
 	switch m.modal {
 	case modalStatus:
 		segs := []seg{txt(sBold.Render(" Set status: "))}
@@ -256,11 +319,9 @@ func (m *model) footer() []string {
 			line1.add(sOK.Render(" ✓ ") + m.msg)
 		}
 	}
-	for _, x := range line1.hits {
-		x.y = y
-		m.hits = append(m.hits, x)
-	}
+}
 
+func (m *model) hint() string {
 	var hint string
 	switch {
 	case m.typing:
@@ -271,6 +332,16 @@ func (m *model) footer() []string {
 		hint = keys("type", "filter", "↑↓", "move", "space", "toggle", "enter", "done")
 	case m.panel != nil:
 		hint = keys("j/k", "field", "enter", "change", "←/→", "cycle", "x", "clear", "esc", "close")
+	case m.vn && (m.focusDetail || m.full):
+		hint = keys("j/k", "links", "enter", "open", "A", "add to search", "esc", "back", "s", "label", "r", "vote", "e/E", "dates", "o", "vndb.org")
+	case m.vn && m.tab == tabSearch && m.resolving != nil:
+		hint = keys("enter", "this is it", "/", "search again", "esc", "cancel")
+	case m.vn && m.tab == tabSearch:
+		hint = keys("/", "type query", "f", "filters", "S", "sort", "X", "clear", "enter", "details", "s", "add/label", "r", "vote", "v", "anime", "?", "help")
+	case m.vn && m.tab == tabNow:
+		hint = keys("f", "finish + vote", "m", "change match", "x", "ignore", "enter", "details/pick", "v", "anime", "?", "help")
+	case m.vn:
+		hint = keys("h/l", "label", "/", "filter", "S", "sort", "enter", "details", "s", "label", "r", "vote", "e/E", "dates", "ctrl+r", "sync", "v", "anime", "?", "help")
 	case m.focusDetail || m.full:
 		hint = keys("j/k", "links", "enter", "open", "A", "add to search", "esc", "back", "s", "status", "+/-", "ep", "r", "score", "o", "open web")
 	case m.tab == tabSearch && m.resolving != nil:
@@ -280,9 +351,55 @@ func (m *model) footer() []string {
 	case m.tab == tabNow:
 		hint = keys("u", "mark watched now", "m", "change match", "x", "ignore", "enter", "details/pick", "?", "help")
 	default:
-		hint = keys("h/l", "section", "/", "filter", "S", "sort", "enter", "details", "s", "status", "+/-", "ep", "e", "set ep", "r", "score", "ctrl+r", "sync", "?", "help")
+		hint = keys("h/l", "section", "/", "filter", "S", "sort", "enter", "details", "s", "status", "+/-", "ep", "e", "set ep", "r", "score", "ctrl+r", "sync", "v", "VN", "?", "help")
 	}
-	return []string{fit(line1.lines[0], m.w), fit(" "+hint, m.w)}
+	return hint
+}
+
+// vnFooterLine is the VN modal prompt (label picker, vote, dates).
+func (m *model) vnFooterLine() block {
+	var line block
+	switch m.modal {
+	case modalStatus:
+		segs := []seg{txt(sBold.Render(" Label: "))}
+		for _, sk := range vnStatusKeys {
+			sk := sk
+			segs = append(segs, seg{text: sKey.Render(sk.key) + " " + labelStyle(sk.label).Render(m.vnLabelName(sk.label)), click: onClick(func() tea.Cmd {
+				m.modal = modalNone
+				return m.vnLabelChoice(sk.key)
+			})}, txt("  "))
+		}
+		cur := m.vnCurrent()
+		for i, l := range m.vnCustomLabels() {
+			k := fmt.Sprint(i + 1)
+			mark := "○ "
+			if cur != nil && cur.Has(l.ID) {
+				mark = "● "
+			}
+			segs = append(segs, seg{text: sKey.Render(k) + " " + labelStyle(l.ID).Render(mark+l.Label), click: onClick(func() tea.Cmd {
+				m.modal = modalNone
+				return m.vnLabelChoice(k)
+			})}, txt("  "))
+		}
+		segs = append(segs, seg{text: sKey.Render("x") + " " + sErr.Render("remove"), click: onClick(func() tea.Cmd {
+			m.modal = modalNone
+			return m.vnLabelChoice("x")
+		})}, txt(sDim.Render("   esc cancel")))
+		line.addSegs(segs...)
+	case modalDelete:
+		line.add(sErr.Render(" Remove from your VNDB list? ") + keys("y", "yes", "esc", "no"))
+	case modalScore:
+		line.add(" Your vote (1-10, e.g. 8.5; 0 clears): " + m.modalInput.View())
+	case modalStarted:
+		line.add(" Started (YYYY-MM-DD, today, - clears): " + m.modalInput.View())
+	case modalFinished:
+		line.add(" Finished (YYYY-MM-DD, today, - clears): " + m.modalInput.View())
+	case modalFinish:
+		line.add(" Mark finished — your vote (1-10, enter to skip): " + m.modalInput.View())
+	default:
+		line.add("")
+	}
+	return line
 }
 
 func keys(kv ...string) string {
@@ -294,8 +411,12 @@ func keys(kv ...string) string {
 }
 
 func (m *model) helpLines() []string {
-	lines := []string{sHead.Render(" Search syntax") + sDim.Render("   (or press f in Search for the clickable filter editor)"), ""}
-	for _, l := range strings.Split(query.Help, "\n") {
+	help, title := query.Help, " Search syntax"
+	if m.vn {
+		help, title = query.VNHelp, " Visual novel search syntax (VNDB)"
+	}
+	lines := []string{sHead.Render(title) + sDim.Render("   (or press f in Search for the clickable filter editor)"), ""}
+	for _, l := range strings.Split(help, "\n") {
 		lines = append(lines, "  "+l)
 	}
 	lines = append(lines, "", sHead.Render(" Keys"), "",
@@ -306,6 +427,7 @@ func (m *model) helpLines() []string {
 		"  /                  search / filter           f  X        filter editor / clear filters (search)",
 		"  u  m  (now)        mark watched / change match            J K  scroll details   o O  AniList / MAL page",
 		"  ctrl+r             sync / reload             q           quit",
+		"  v                  anime ↔ visual novels     (VN: s label · r vote · e/E started/finished · f finish now)",
 		"",
 		sHead.Render(" Mouse"),
 		"  click rows, tabs, chips, buttons, genres, tags and related shows · right-click cycles back / removes",
